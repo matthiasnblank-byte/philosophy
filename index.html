@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Philosophie – Zoomable Circle Packing (D3 v7)</title>
+
+  <!-- D3.js v7 via CDN (funktioniert ohne lokalen Server) -->
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+
+  <style>
+    :root{
+      --bg: #f6f7f9;
+      --stroke: rgba(255,255,255,0.95);
+      --text: #1f2937;
+      --muted: rgba(31,41,55,0.75);
+    }
+    html, body { height: 100%; margin: 0; }
+    body{
+      background: var(--bg);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Noto Sans", "Liberation Sans", sans-serif;
+      color: var(--text);
+      overflow: hidden;
+    }
+    svg{
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      background: var(--bg);
+    }
+
+    .node circle{
+      stroke: var(--stroke);
+      stroke-width: 1.25;
+      shape-rendering: geometricPrecision;
+    }
+    .node--leaf circle{
+      stroke-width: 1;
+    }
+
+    .labels{
+      pointer-events: none;
+      user-select: none;
+    }
+    .label{
+      fill: var(--text);
+      font-size: 12px;
+      text-anchor: middle;
+      dominant-baseline: middle;
+      paint-order: stroke;
+      stroke: rgba(255,255,255,0.7);
+      stroke-width: 3px;
+      stroke-linejoin: round;
+    }
+    .label.depth-1{ font-size: 14px; font-weight: 600; }
+    .label.depth-2{ font-size: 12px; font-weight: 600; fill: var(--muted); }
+    .label.depth-3{ font-size: 11px; fill: rgba(31,41,55,0.65); }
+
+    .hint{
+      position: fixed;
+      left: 14px; bottom: 12px;
+      padding: 8px 10px;
+      background: rgba(255,255,255,0.7);
+      border: 1px solid rgba(0,0,0,0.06);
+      border-radius: 10px;
+      backdrop-filter: blur(8px);
+      font-size: 12px;
+      color: rgba(31,41,55,0.75);
+    }
+  </style>
+</head>
+<body>
+  <svg id="viz" aria-label="Zoomable Circle Packing: Geschichte der Philosophie"></svg>
+  <div class="hint">Klick zum Reinzoomen, Klick auf Hintergrund zum Rauszoomen.</div>
+
+  <script>
+    // =========================
+    // 1) DATEN (Hierarchie)
+    // =========================
+    // HIER tauschen: Ersetze das Sample 1:1 durch dein vollständiges JSON.
+    // Struktur: Root ("Philosophie") -> Zeitalter -> Schulen -> Denker (Blätter)
+    const data = {
+      name: "Philosophie",
+      children: [
+        {
+          name: "Antike",
+          children: [
+            {
+              name: "Stoa",
+              children: [
+                { name: "Seneca", value: 1 },
+                { name: "Epiktet", value: 1 }
+              ]
+            },
+            {
+              name: "Platonismus",
+              children: [
+                { name: "Platon", value: 1 },
+                { name: "Plotin", value: 1 }
+              ]
+            }
+          ]
+        },
+        {
+          name: "Aufklärung",
+          children: [
+            {
+              name: "Rationalismus",
+              children: [
+                { name: "Descartes", value: 1 },
+                { name: "Spinoza", value: 1 }
+              ]
+            },
+            {
+              name: "Empirismus",
+              children: [
+                { name: "Locke", value: 1 },
+                { name: "Hume", value: 1 }
+              ]
+            }
+          ]
+        }
+      ]
+    };
+
+    // =========================
+    // 2) EASING: cubic-bezier
+    // =========================
+    // D3 nutzt normalerweise "easeCubicInOut" etc. – hier implementieren wir echte cubic-bezier
+    // für eine "CSS-artige" Transition (wie gefordert).
+    function cubicBezier(p1x, p1y, p2x, p2y) {
+      const cx = 3 * p1x, bx = 3 * (p2x - p1x) - cx, ax = 1 - cx - bx;
+      const cy = 3 * p1y, by = 3 * (p2y - p1y) - cy, ay = 1 - cy - by;
+
+      function sampleCurveX(t) { return ((ax * t + bx) * t + cx) * t; }
+      function sampleCurveY(t) { return ((ay * t + by) * t + cy) * t; }
+      function sampleCurveDerivativeX(t) { return (3 * ax * t + 2 * bx) * t + cx; }
+
+      function solveCurveX(x) {
+        let t2 = x;
+        // Newton-Raphson
+        for (let i = 0; i < 8; i++) {
+          const x2 = sampleCurveX(t2) - x;
+          const d2 = sampleCurveDerivativeX(t2);
+          if (Math.abs(x2) < 1e-6) return t2;
+          if (Math.abs(d2) < 1e-6) break;
+          t2 = t2 - x2 / d2;
+        }
+        // Bisection fallback
+        let t0 = 0, t1 = 1;
+        t2 = x;
+        while (t0 < t1) {
+          const x2 = sampleCurveX(t2);
+          if (Math.abs(x2 - x) < 1e-6) return t2;
+          if (x > x2) t0 = t2; else t1 = t2;
+          t2 = (t1 + t0) / 2;
+        }
+        return t2;
+      }
+
+      return function ease(t) {
+        if (t <= 0) return 0;
+        if (t >= 1) return 1;
+        return sampleCurveY(solveCurveX(t));
+      };
+    }
+
+    const easeSmooth = cubicBezier(0.4, 0.0, 0.2, 1.0);
+
+    // =========================
+    // 3) LAYOUT / RENDER
+    // =========================
+    const svg = d3.select("#viz");
+
+    let g, labelSel;
+    let root, focus;
+    let view; // [x, y, diameter]
+
+    // Palette: differenziert primär nach Zeitalter (Tiefe 1)
+    const palette = d3.scaleOrdinal(d3.schemePastel1);
+
+    function topAncestorName(d) {
+      // Zeitalter-Name (depth 1) als Farbanker
+      let cur = d;
+      while (cur && cur.depth > 1) cur = cur.parent;
+      return (cur && cur.data && cur.data.name) ? cur.data.name : "Philosophie";
+    }
+
+    function fillColor(d) {
+      if (!d.parent) return "#ffffff";
+      const base = d3.color(palette(topAncestorName(d)));
+      if (!base) return "#e5e7eb";
+      if (d.depth === 1) return base.formatHex();
+      if (d.depth === 2) return base.brighter(0.35).formatHex();
+      return base.brighter(0.7).formatHex();
+    }
+
+    // Schnelle Heuristik: ob Text vermutlich in Kreis passt
+    function fitsInCircle(d) {
+      if (!d?.data?.name) return false;
+      const r = d.r || 0;
+      const approxCharPx = 6.6; // konservativ
+      const maxTextWidth = 2 * r * 0.82;
+      return (d.data.name.length * approxCharPx) <= maxTextWidth && r >= 18;
+    }
+
+    function compute(width, height) {
+      root = d3.hierarchy(data)
+        .sum(d => d.value || 1)
+        .sort((a, b) => b.value - a.value);
+
+      const pack = d3.pack()
+        .size([width, height])
+        .padding(d => (d.depth <= 2 ? 3 : 2));
+
+      pack(root);
+      focus = root;
+      view = [root.x, root.y, root.r * 2];
+    }
+
+    function zoomTo(v, width, height) {
+      const k = width / v[2];
+      view = v;
+      g.attr("transform", `translate(${width / 2 - v[0] * k},${height / 2 - v[1] * k}) scale(${k})`);
+    }
+
+    function labelShouldShow(d) {
+      // Zeitalter (depth 1) & Schulen (depth 2): immer, wenn es passt
+      if (d.depth === 1 || d.depth === 2) return fitsInCircle(d);
+
+      // Denker (depth 3): erst sichtbar, wenn in die Schule (depth 2) reingezoomt
+      if (d.depth === 3) return (focus?.depth === 2 && d.parent === focus && fitsInCircle(d));
+
+      return false;
+    }
+
+    function updateLabelVisibility() {
+      labelSel
+        .style("display", d => labelShouldShow(d) ? "block" : "none")
+        .style("opacity", d => labelShouldShow(d) ? 1 : 0);
+    }
+
+    function zoom(d, width, height) {
+      if (!d) return;
+      focus = d;
+
+      const transition = svg.transition()
+        .duration(750)
+        .ease(easeSmooth)
+        .tween("zoom", () => {
+          const i = d3.interpolateZoom(view, [focus.x, focus.y, focus.r * 2]);
+          return t => zoomTo(i(t), width, height);
+        });
+
+      transition.on("end", updateLabelVisibility);
+      transition.on("interrupt", updateLabelVisibility);
+      updateLabelVisibility();
+    }
+
+    function render() {
+      const { width, height } = svg.node().getBoundingClientRect();
+      const W = Math.max(320, Math.floor(width));
+      const H = Math.max(320, Math.floor(height));
+
+      // Responsiv & high-res via viewBox
+      svg.attr("viewBox", `0 0 ${W} ${H}`);
+
+      compute(W, H);
+
+      svg.selectAll("*").remove();
+
+      // Hintergrund-Klick = Zoom-Out zur Root
+      svg.on("click", (event) => {
+        if (event.target === svg.node()) zoom(root, W, H);
+      });
+
+      g = svg.append("g");
+
+      const nodes = g.append("g")
+        .attr("class", "nodes")
+        .selectAll("g")
+        .data(root.descendants())
+        .join("g")
+        .attr("class", d => `node ${d.children ? "node--internal" : "node--leaf"}`)
+        .attr("transform", d => `translate(${d.x},${d.y})`);
+
+      nodes.append("circle")
+        .attr("r", d => d.r)
+        .attr("fill", d => fillColor(d))
+        .style("cursor", d => (d.children ? "pointer" : "default"))
+        .on("click", (event, d) => {
+          event.stopPropagation();
+          if (d === root) return zoom(root, W, H);
+          if (focus === d) return zoom(d.parent || root, W, H);
+          if (d.children) zoom(d, W, H);
+        });
+
+      labelSel = g.append("g")
+        .attr("class", "labels")
+        .selectAll("text")
+        .data(root.descendants().filter(d => d.depth > 0))
+        .join("text")
+        .attr("class", d => `label depth-${d.depth}`)
+        .attr("transform", d => `translate(${d.x},${d.y})`)
+        .text(d => d.data.name);
+
+      zoomTo([root.x, root.y, root.r * 2], W, H);
+      updateLabelVisibility();
+    }
+
+    render();
+    window.addEventListener("resize", render);
+  </script>
+</body>
+</html>
